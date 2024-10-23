@@ -1,0 +1,32 @@
+#!/usr/bin/env luajit
+
+local function refmt(osize)
+	if osize == '0' then return osize end
+	local v, oscale = string.match(osize, '(%d+)%s*(.+)')
+	local n = tonumber(v)
+
+	local tbl = {'B', 'kB', 'mB', 'gB', 'tB', 'pB', 'eB'}
+	local ln = math.max(0, math.floor(math.log(n, 1024)))
+	local ns = n * 1024^-(ln-1)
+
+	return string.format('%.1f %s', ns, tbl[ln + 1] or 'B')
+end
+
+local function meminfo()
+	local function iter()
+		local fmem = assert(io.open("/proc/meminfo"))
+		local pat = "(.+):%s*(.+)"
+		for line in fmem:lines() do
+			local k, v = string.match(line, pat)
+			coroutine.yield(k, refmt(v))
+		end
+		fmem:close()
+	end
+
+	return coroutine.wrap(iter)
+end
+
+
+for k,v in meminfo() do
+	print(string.format('%17s: %10s', k, v))
+end

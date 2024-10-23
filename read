@@ -1,0 +1,324 @@
+#!/usr/bin/env luajit
+
+local bit = require('bit')
+local setmetatable = setmetatable
+
+local function printf(fmt, ...)
+	local s = string.format(fmt, ...)
+	io.write(s)
+end
+
+local MT = {}
+local Dump = setmetatable({}, { __index = MT })
+
+function MT:open(filename)
+	local err
+	self._file, err = io.open(filename, 'rb')
+	assert(self._file, err)
+	return self
+end
+
+function MT:inherit()
+	return setmetatable({}, { __index = MT })
+end
+
+function MT:read_byte()
+	local b = string.byte(self._file:read(1))
+	return b
+end
+
+---@param n integer
+function MT:read_bytes(n)
+	return self._file:read(n)
+end
+
+---@param unit integer
+---@param length integer
+function MT:read_chunks(unit, length)
+	local b = self._file:read(unit * length)
+	local t = {}
+	for i = 0, length-1 do
+		local o = i*unit + 1
+		local s = string.sub(b, o, o + unit)
+		table.insert(t, { string.byte(s, 1, unit) })
+	end
+	return t
+end
+
+function MT:read_uleb()
+	local result = 0
+	local shift = 0
+	while shift < 28 do
+		local byte = self:read_byte()
+		result = bit.bor(result, bit.lshift(bit.band(byte, 0x7f), shift))
+		if byte < 0x80 then break end
+		shift = shift + 7
+	end
+	return result
+end
+
+local COMPAT_FLAGS = {
+	BE    = 0x1,
+	STRIP = 0x2,
+	FFI   = 0x4,
+	FR2   = 0x8,
+	KNOWN = 0xF, -- le wtf
+	DETERMINISTIC = 0x800000000000,
+}
+
+local PROTO_FLAGS = {
+	HAS_CHILD          = 0x1,
+	IS_VARARG          = 0x2,
+	FFI_USES_KCDATA    = 0x04,
+	JIT_DISABLED       = 0x08,
+	BC_PATCHED_ILOOP   = 0x10,
+	HAS_RETURN         = 0x20,
+	NEEDS_FIXUP_RETURN = 0x40,
+}
+
+local function compat_flags(val)
+	local flags = {}
+	if bit.band(COMPAT_FLAGS.KNOWN, val) == COMPAT_FLAGS.KNOWN then
+		flags.KNOWN = true
+		return flags
+	end
+
+	flags.BE = bit.band(val, COMPAT_FLAGS.BE) > 0
+	flags.DEBUG = bit.band(val, COMPAT_FLAGS.STRIP) == 0
+	flags.FFI = bit.band(val, COMPAT_FLAGS.FFI) > 0
+	flags.FR2 = bit.band(val, COMPAT_FLAGS.FR2) > 0
+	flags.DETERMINISTIC = bit.band(val, COMPAT_FLAGS.DETERMINISTIC) > 0
+
+	return flags
+end
+
+function MT:read_proto_header()
+	local head = {}
+	head.flags = self:read_uleb()
+	head.n_params = self:read_byte()
+	head.frame_size = self:read_byte()
+	head.n_upvals = self:read_byte()
+	head.numkgc = self:read_uleb()
+	head.numkn = self:read_uleb()
+	head.numbc = self:read_uleb()
+
+	if self.flags.DEBUG then
+		head.debuglen = self:read_uleb()
+		if head.debuglen > 0 then
+			head.first_line = self:read_uleb()
+			head.num_lines = self:read_uleb()
+		end
+	end
+	return head
+end
+
+function MT:read_short()
+	local hi, lo = string.byte(self._file:read(2), 1, 2)
+	return bit.bor(bit.lshift(hi, 8), lo)
+end
+
+---@param n integer
+function MT:read_shorts(n)
+	local t = {}
+	for i = 1, n do
+		table.insert(t, self:read_short())
+	end
+	return t
+end
+
+local GC_TYPE = {
+	child = 0,
+	table = 1,
+	int = 2,
+	uint = 3,
+	complex = 4,
+	str = 5,
+}
+
+local TV_TYPE = {
+	NIL   = 0,
+	FALSE = 1,
+	TRUE  = 2,
+	INT   = 3,
+	NUM   = 4,
+	STR   = 5
+}
+
+function MT:read_table_value()
+	local null = setmetatable({}, { __tostring = function() return 'nil'end })
+	local tt = self:read_uleb()
+
+	if tt == TV_TYPE.NIL then
+		return null
+	elseif tt == TV_TYPE.FALSE then
+		return false
+	elseif tt == TV_TYPE.TRUE then
+		return true
+	elseif tt == TV_TYPE.INT then
+		return self:read_int()
+	elseif tt == TV_TYPE.NUM then
+		return self:read_num()
+	elseif tt >= TV_TYPE.STR then
+		return self:read_bytes(tt - TV_TYPE.STR)
+	end
+end
+
+function MT:read_hash()
+	return self:read_table_value(), self:read_table_value()
+end
+
+function MT:read_table()
+	local n_arr = self:read_uleb()
+	local n_hash = self:read_uleb()
+	local arr = {}
+	local hash = {}
+	for i = 1, n_arr do
+		table.insert(arr, self:read_table_value())
+	end
+	for i = 1, n_hash do
+		table.insert(hash, { self:read_hash() })
+	end
+
+	return { arr = arr, hash = hash }
+end
+
+---@param n integer
+function MT:read_gc_objs(n)
+	local objs = {}
+	for i = 1, n do
+		local gt = self:read_uleb()
+		local val
+
+		if gt == GC_TYPE.child then
+			val = 'child'
+		elseif gt == GC_TYPE.table then
+			val = self:read_table()
+		elseif gt == GC_TYPE.int then
+			val = self:read_uleb()
+		elseif gt == GC_TYPE.uint then
+			val = self:read_uleb()
+		elseif gt == GC_TYPE.complex then
+			val = self:read_uleb() + self:read_uleb()
+		elseif gt >= GC_TYPE.str then
+			local len = gt - GC_TYPE.str
+			val = self:read_bytes(len)
+		end
+		table.insert(objs, val)
+	end
+	return objs
+end
+
+function MT:read_num()
+	local a = self:read_uleb()
+	local b
+	if bit.band(a, 1) then
+		a = bit.rshift(a, 1)
+		b = self:read_uleb()
+		return bit.bor(a, b)
+	end
+	return a
+end
+
+function MT:read_nums(n)
+	local nums = {}
+	for i = 1, n do
+		table.insert(nums, self:read_num())
+	end
+	return nums
+end
+
+function MT:read_proto_data(length)
+	local data = setmetatable({}, { __index = MT })
+	data.head = self:read_proto_header()
+	data.instructions = self:read_chunks(4, data.head.numbc)
+	data.uvdata = self:read_shorts(data.head.n_upvals)
+	print('kgc objects')
+	data.gc = self:read_gc_objs(data.head.numkgc)
+	data.nums = self:read_nums(data.head.numkn)
+
+	if self.flags.DEBUG then
+		data.debug = self:read_bytes(data.head.debuglen)
+	end
+
+	return data
+end
+
+function MT:read_proto()
+	local proto = setmetatable({}, { __index = MT })
+	proto.length = self:read_uleb()
+	proto.data = self:read_proto_data(length)
+
+	return proto
+end
+
+local function sorted(tab)
+	local t = {}
+	for k,v in pairs(tab) do
+		table.insert(t, {k=k, v=v})
+		if type(k) ~= 'number' then t.is_set = true end
+	end
+	table.sort(t, function(a, b) return a.k<b.k end)
+	return t
+end
+
+local function recurse(tab, depth)
+	depth = depth or 1
+	local space = string.rep('  ', depth)
+	local space2 = string.rep('  ', depth - 1)
+	local ft = {}
+	local sortd = sorted(tab)
+	local iss = sortd.is_set
+	local da = iss and '{' or '['
+	local db = iss and '}' or ']'
+	printf('%s\n', da)
+	for _, v in ipairs(sortd) do
+		local sep = iss and (v.k .. ': ') or ''
+		if type(v.v) == "table" then
+			local mt = getmetatable(v.v)
+			if mt and mt.__tostring then
+				printf('%s%s%s,\n', space, sep,tostring(v.v))
+			else
+				table.insert(ft, v)
+			end
+		else
+			printf('%s%s%q,\n', space, sep, v.v)
+		end
+	end
+	for _, v in ipairs(ft) do
+		local sep = iss and (v.k .. ': ') or ''
+		printf('%s%s', space, sep)
+		recurse(v.v, depth+1)
+	end
+	printf('%s%s,\n', space2, db)
+end
+
+local function read_dump(filename)
+	local dump = setmetatable({}, { __index = Dump })
+	dump:open(filename)
+	local magic = dump:read_bytes(3)
+	assert(magic == '\x1BLJ', "invalid format")
+	dump.version = dump:read_byte()
+	dump.flags = compat_flags(dump:read_uleb())
+	if dump.flags.DEBUG then
+		dump.debuglen = dump:read_uleb()
+		dump.debuginfo = dump:read_bytes(dump.debuglen)
+	end
+	dump.proto = dump:read_proto()
+
+	printf('dump.header.magic = %s\n', string.gsub(magic, '\x1B', '\\x1B'))
+	printf('dump.header.version: %d\n', dump.version)
+
+	for _,v in ipairs(sorted(dump.flags)) do
+		printf('dump.header.compat.%s: %s\n', v.k, v.v)
+	end
+	if dump.flags.DEBUG then
+		printf('dump.header.debuglen: %s\n', dump.debuglen)
+		printf('dump.header.debuginfo: %s\n', dump.debuginfo)
+	end
+
+	recurse(dump)
+
+	printf('\neof: %s\n', dump:read_byte() == 0)
+end
+
+read_dump('./mem.luac.dbg')
